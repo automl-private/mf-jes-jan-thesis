@@ -133,6 +133,8 @@ BENCHMARK_COLORS = {
 }
 
 ALGORITHMS = {
+    "mf-mes": "MF-MES",
+    "mes": "MES",
     "random_search": "RS",
     "random_search_prior": "RS+Prior",
     "random_search_prior-50": "RS+Prior(50%)",
@@ -286,6 +288,8 @@ DATASETS = {
 
 # https://matplotlib.org/stable/gallery/color/named_colors.html
 COLOR_MARKER_DICT = {
+    "mf-mes" : "darkgreen",
+    "mes" : "blue",
     "random_search": "palevioletred",
     "random_search_prior": "magenta",
     "random_search_prior-50": "indigo",
@@ -293,7 +297,7 @@ COLOR_MARKER_DICT = {
     "bo-10": "darkgoldenrod",
     "bohb": "darkcyan",
     "mobster": "black",
-    # "successive_halving": "SH",
+    "successive_halving": "black",
     # "successive_halving_prior": "SH+Prior",
     # "successive_halving_prior-50": "SH+Prior(50%)",
     "hpbandster": "darkgreen",

@@ -13,6 +13,8 @@ import yaml
 from gitinfo import gitinfo
 from omegaconf import OmegaConf
 
+import torch
+
 logger = logging.getLogger("mf_prior_experiments.run")
 
 # NOTE: If editing this, please look for MIN_SLEEP_TIME
@@ -28,7 +30,7 @@ print(f"{'='*50}\noverwrite={OVERWRITE}\n{'='*50}")
 def _set_seeds(seed):
     random.seed(seed)  # important for NePS optimizers
     np.random.seed(seed)  # important for NePS optimizers
-    # torch.manual_seed(seed)
+    torch.manual_seed(seed)
     # torch.backends.cudnn.benchmark = False
     # torch.backends.cudnn.deterministic = True
     # torch.manual_seed(seed)
@@ -277,6 +279,164 @@ def run_neps(args):
         overwrite_working_directory=OVERWRITE,
     )
 
+def run_botorch(args):
+    from mfpbench import Benchmark
+
+    from os import makedirs, chdir
+
+    import yaml
+
+    import torch
+    from botorch import fit_gpytorch_model
+    from botorch.optim.optimize import optimize_acqf
+    from botorch.acquisition.fixed_feature import FixedFeatureAcquisitionFunction
+    from botorch.models.gp_regression_fidelity import SingleTaskMultiFidelityGP
+    from botorch.models.gp_regression import SingleTaskGP
+    from gpytorch.mlls.exact_marginal_log_likelihood import ExactMarginalLogLikelihood
+    from botorch.utils.sampling import draw_sobol_samples
+    from botorch.models.transforms.outcome import Standardize
+
+    from botorch.models.transforms.outcome import Standardize
+    from botorch.utils.transforms import unnormalize
+
+    config_counter = 0
+
+    def query_benchmark_and_log(x,train_obj, hyperparameter, benchmark):
+        start = time.time()
+        config = dict()
+        for j in range(len(hyperparameter)):
+            h = hyperparameter[j]
+            if args.algorithm.mf:
+                config[h.name] = x[j+1]
+            else:
+                config[h.name] = x[j]
+        if args.algorithm.mf:
+            result = benchmark.query(config, at=int(x[0]))
+        else:
+            result = benchmark.query(config, at=benchmark.end)
+        max_fidelity_result = benchmark.query(config, at=benchmark.end)
+        train_obj = torch.cat([train_obj, torch.tensor([result.error])])
+        end = time.time()
+        folder = f'config_{config_counter}_0'
+        makedirs(folder, exist_ok=True)
+        info_dict = {
+            "loss": result.error,
+            "cost": result.cost,
+            "info_dict": {
+                "cost": result.cost,
+                "val_score": result.val_score,
+                "test_score": result.test_score,
+                "fidelity": result.fidelity,
+                "continuation_fidelity": None,
+                "start_time": start,
+                "end_time": end,  # + fidelity,
+                "max_fidelity_loss": float(max_fidelity_result.error),
+                "max_fidelity_cost": float(max_fidelity_result.cost),
+                "process_id": os.getpid(),
+                },
+        }
+        with open(folder + "/result.yaml", "w+") as outfile:
+            yaml.dump(info_dict, outfile)
+        return result.cost, train_obj
+
+
+    makedirs("neps_root_directory/results", exist_ok = True)
+    chdir("neps_root_directory/results")
+
+    benchmark: Benchmark = hydra.utils.instantiate(args.benchmark.api)  # type: ignore
+    pipeline_space =  benchmark.space
+    fidelity_min, fidelity_max, _ = benchmark.fidelity_range
+    hyperparameter = pipeline_space.get_hyperparameters()
+    x = hyperparameter[0]
+    cost_total = 0.0
+    lowers = list()
+    uppers = list()
+    if args.algorithm.mf:
+        lowers.append(fidelity_min)
+        uppers.append(fidelity_max)
+    for i in hyperparameter:
+        lowers.append(i.lower)
+        uppers.append(i.upper)
+    bounds = torch.tensor([lowers, uppers])
+
+
+    # initialize model
+    INITIAL_DESIGN_SIZE=16
+    train_x = draw_sobol_samples(bounds, 1, INITIAL_DESIGN_SIZE).squeeze()
+    train_obj = torch.Tensor()
+    for i in range(INITIAL_DESIGN_SIZE):
+        cost, train_obj = query_benchmark_and_log(train_x[i], train_obj, hyperparameter, benchmark)
+        cost_total = cost_total + cost
+        config_counter = config_counter + 1
+
+    # train model
+    # train_obj = train_obj.reshape(-1,1)
+    for i in range(1000):
+        if args.algorithm.mf:
+            model = SingleTaskMultiFidelityGP(
+                train_x,
+                train_obj.unsqueeze(1),
+                outcome_transform=Standardize(m=1),
+                iteration_fidelity=0
+            )
+        else:
+            model = SingleTaskGP(
+                train_x,
+                train_obj.unsqueeze(1),
+                outcome_transform=Standardize(m=1),
+            )
+        mll = ExactMarginalLogLikelihood(model.likelihood, model)
+        fit_gpytorch_model(mll)
+        candidate_set = draw_sobol_samples(bounds, 1,1024).squeeze()
+        if "jes" in args.algorithm.name:
+            breakpoint()
+            optimal_out = train_obj.argmin()
+            optimal_in = train_x[optimal_out]
+            acquisition_function = hydra.utils.instantiate(args.algorithm.searcher, model= model, )
+        else:
+            acquisition_function = hydra.utils.instantiate(args.algorithm.searcher, model= model, candidate_set = candidate_set)
+        candidate, _ = optimize_acqf(acquisition_function, bounds, 1, num_restarts=1, raw_samples=1024)
+        candidate = candidate.detach()
+        train_x = torch.cat([train_x, candidate])
+        candidate= candidate.squeeze()
+        cost, train_obj = query_benchmark_and_log(candidate, train_obj, hyperparameter, benchmark)
+        config_counter = config_counter + 1
+        cost_total = cost_total + cost
+        if i%10 == 0:
+            print(i)
+
+    # breakpoint()
+
+
+
+    # result = benchmark.query(config, at=fidelity)
+
+    # max_fidelity_result = benchmark.query(config, at=benchmark.end)
+
+    # end = time.time()
+    # info_dict = {
+    #     "loss": result.error,
+    #     "cost": result.cost,
+    #     "info_dict": {
+    #         "cost": result.cost,
+    #         "val_score": result.val_score,
+    #         "test_score": result.test_score,
+    #         "fidelity": result.fidelity,
+    #         "continuation_fidelity": None,
+    #         "start_time": start,
+    #         "end_time": end,  # + fidelity,
+    #         "max_fidelity_loss": float(max_fidelity_result.error),
+    #         "max_fidelity_cost": float(max_fidelity_result.cost),
+    #         "process_id": os.getpid(),
+    #         },
+    # }
+
+    lower, upper, _ = benchmark.fidelity_range
+    fidelity_name = benchmark.fidelity_name
+
+    if args.algorithm.mf:
+        pass
+    # breakpoint()
 
 @hydra.main(config_path="configs", config_name="run", version_base="1.2")
 def run(args):
