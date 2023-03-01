@@ -263,9 +263,9 @@ def run_neps(args):
     #     budget_args = {"max_evaluations_total": 50}
 
     if "mf" in args.algorithm and args.algorithm.mf:
-        max_evaluations_total = 130
+        max_evaluations_total = 1000
     else:
-        max_evaluations_total = 25
+        max_evaluations_total = 100
 
     neps.run(
         run_pipeline=run_pipeline,
@@ -295,9 +295,12 @@ def run_botorch(args):
     from gpytorch.mlls.exact_marginal_log_likelihood import ExactMarginalLogLikelihood
     from botorch.utils.sampling import draw_sobol_samples
     from botorch.models.transforms.outcome import Standardize
+    from botorch.models.transforms.input import Normalize
+    from ConfigSpace.hyperparameters import UniformIntegerHyperparameter
 
     from botorch.models.transforms.outcome import Standardize
     from botorch.utils.transforms import unnormalize
+    from math import log,exp
 
     config_counter = 0
 
@@ -307,9 +310,20 @@ def run_botorch(args):
         for j in range(len(hyperparameter)):
             h = hyperparameter[j]
             if args.algorithm.mf:
-                config[h.name] = x[j+1]
+                index_ = j+1
             else:
-                config[h.name] = x[j]
+                index_ = j
+            if isinstance(h, UniformIntegerHyperparameter):
+                if h.log:
+                    config[h.name] = int(exp(x[index_]))
+                else:
+                    config[h.name] = int(x[index_])
+            else:
+                if h.log:
+                    config[h.name] = min(max(float(exp(x[index_])), h.lower), h.upper)
+                else:
+                    config[h.name] = min(max(float(x[index_]), h.lower), h.upper)
+                # breakpoint()
         if args.algorithm.mf:
             result = benchmark.query(config, at=int(x[0]))
         else:
@@ -337,7 +351,7 @@ def run_botorch(args):
         }
         with open(folder + "/result.yaml", "w+") as outfile:
             yaml.dump(info_dict, outfile)
-        return result.cost, train_obj
+        return result.cost, train_obj, result.fidelity
 
 
     makedirs("neps_root_directory/results", exist_ok = True)
@@ -349,34 +363,41 @@ def run_botorch(args):
     hyperparameter = pipeline_space.get_hyperparameters()
     x = hyperparameter[0]
     cost_total = 0.0
+    fidelity_total = 0.0
     lowers = list()
     uppers = list()
     if args.algorithm.mf:
         lowers.append(fidelity_min)
         uppers.append(fidelity_max)
     for i in hyperparameter:
-        lowers.append(i.lower)
-        uppers.append(i.upper)
+        if i.log:
+            lowers.append(log(i.lower))
+            uppers.append(log(i.upper))
+        else:
+            lowers.append(i.lower)
+            uppers.append(i.upper)
     bounds = torch.tensor([lowers, uppers])
 
 
     # initialize model
-    INITIAL_DESIGN_SIZE=16
+    INITIAL_DESIGN_SIZE=8
     train_x = draw_sobol_samples(bounds, 1, INITIAL_DESIGN_SIZE).squeeze()
     train_obj = torch.Tensor()
     for i in range(INITIAL_DESIGN_SIZE):
-        cost, train_obj = query_benchmark_and_log(train_x[i], train_obj, hyperparameter, benchmark)
+        cost, train_obj, fidelity_current = query_benchmark_and_log(train_x[i], train_obj, hyperparameter, benchmark)
         cost_total = cost_total + cost
+        fidelity_total = fidelity_total + fidelity_current
         config_counter = config_counter + 1
 
     # train model
     # train_obj = train_obj.reshape(-1,1)
-    for i in range(1000):
+    while fidelity_total/fidelity_max  <100:
         if args.algorithm.mf:
             model = SingleTaskMultiFidelityGP(
                 train_x,
                 train_obj.unsqueeze(1),
                 outcome_transform=Standardize(m=1),
+                input_transform=Normalize(len(bounds[0]), bounds=bounds),
                 iteration_fidelity=0
             )
         else:
@@ -384,26 +405,33 @@ def run_botorch(args):
                 train_x,
                 train_obj.unsqueeze(1),
                 outcome_transform=Standardize(m=1),
+                input_transform=Normalize(len(bounds[0]), bounds=bounds),
             )
         mll = ExactMarginalLogLikelihood(model.likelihood, model)
         fit_gpytorch_model(mll)
         candidate_set = draw_sobol_samples(bounds, 1,1024).squeeze()
         if "jes" in args.algorithm.name:
+            num_optima = 8
+            posterior = model.posterior(candidate_set)
+            posterior_samples = posterior.rsample(sample_shape=torch.Size([num_optima])).squeeze()
+            f_star, optimal_indices = torch.max(posterior_samples, dim=1)
+            f_star = f_star.unsqueeze(1)
+            X_star = candidate_set[optimal_indices]
+            # optimal_out = train_obj.argmin()
+            # optimal_in = train_x[optimal_out]
             breakpoint()
-            optimal_out = train_obj.argmin()
-            optimal_in = train_x[optimal_out]
-            acquisition_function = hydra.utils.instantiate(args.algorithm.searcher, model= model, )
+            acquisition_function = hydra.utils.instantiate(args.algorithm.searcher, model= model, maximize = False, optimal_outputs=f_star, optimal_inputs=X_star, num_samples=num_optima)
         else:
-            acquisition_function = hydra.utils.instantiate(args.algorithm.searcher, model= model, candidate_set = candidate_set)
-        candidate, _ = optimize_acqf(acquisition_function, bounds, 1, num_restarts=1, raw_samples=1024)
+            acquisition_function = hydra.utils.instantiate(args.algorithm.searcher, model= model, candidate_set = candidate_set, maximize = False)
+        candidate, _ = optimize_acqf(acquisition_function, bounds, 1, num_restarts=20, raw_samples=1024)
         candidate = candidate.detach()
         train_x = torch.cat([train_x, candidate])
         candidate= candidate.squeeze()
-        cost, train_obj = query_benchmark_and_log(candidate, train_obj, hyperparameter, benchmark)
+        cost, train_obj, fidelity_current = query_benchmark_and_log(candidate, train_obj, hyperparameter, benchmark)
         config_counter = config_counter + 1
         cost_total = cost_total + cost
-        if i%10 == 0:
-            print(i)
+        fidelity_total = fidelity_total + fidelity_current
+        print(cost_total, fidelity_total / fidelity_max)
 
     # breakpoint()
 
